@@ -39,7 +39,7 @@ from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from mcp.shared._context_streams import ContextReceiveStream, ContextSendStream, create_context_streams
@@ -560,6 +560,16 @@ class StreamableHTTPServerTransport:
         writer = self._read_stream_writer
         if writer is None:  # pragma: no cover
             raise ValueError("No read stream writer available. Ensure connect() is called first.")
+        response_started = False
+        original_send = send
+
+        async def track_response(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await original_send(message)
+
+        send = track_response
         try:
             # Validate Accept header
             if not await self._validate_accept_header(request, scope, send):
@@ -714,16 +724,31 @@ class StreamableHTTPServerTransport:
                 finally:
                     await sse_stream_reader.aclose()
 
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            # Session teardown can race with notifications (already answered
+            # 202) as well as requests. Never restart a completed response or
+            # try reporting a closed channel through that same channel.
+            logger.debug("Session closed while dispatching POST")
+            if not response_started:
+                response = self._create_error_response(
+                    "Session terminated before the request completed",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    INTERNAL_ERROR,
+                )
+                await response(scope, receive, send)
         except Exception as err:
             logger.exception("Error handling POST request")
-            response = self._create_error_response(
-                "Error handling POST request",
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                INTERNAL_ERROR,
-            )
-            await response(scope, receive, send)
-            await writer.send(Exception(err))
-            return
+            if not response_started:
+                response = self._create_error_response(
+                    "Error handling POST request",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    INTERNAL_ERROR,
+                )
+                await response(scope, receive, send)
+            try:
+                await writer.send(Exception(err))
+            except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+                logger.debug("Session closed before POST error could be delivered")
 
     async def _handle_get_request(self, request: Request, send: Send) -> None:
         """Handle GET request to establish SSE.
